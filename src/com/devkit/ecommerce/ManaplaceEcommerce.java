@@ -86,6 +86,13 @@ public class ManaplaceEcommerce extends AndroidNonvisibleComponent {
     private String couponCode = "";
     private double couponDiscount = 0;
 
+    // Devises : affichage choisi par l'utilisateur (HTG ou USD), devise de base des produits,
+    // et taux = nombre de gourdes (HTG) pour 1 dollar (USD), fourni par le serveur.
+    private String displayCurrency = "";
+    private String baseCurrency = "HTG";
+    private double exchangeRate = 0;
+    private String pendingCouponCode = "";
+
     public ManaplaceEcommerce(ComponentContainer container) {
         super(container.$form());
         context = container.$context();
@@ -124,6 +131,13 @@ public class ManaplaceEcommerce extends AndroidNonvisibleComponent {
         couponCode = prefs.getString("coupon", "");
         couponDiscount = Double.longBitsToDouble(
                 prefs.getLong("discount", Double.doubleToLongBits(0)));
+        baseCurrency = prefs.getString("base_currency", "HTG");
+        exchangeRate = Double.longBitsToDouble(
+                prefs.getLong("exchange_rate", Double.doubleToLongBits(0)));
+        displayCurrency = prefs.getString("display_currency", "");
+        if (displayCurrency.isEmpty()) {
+            displayCurrency = "HT".equalsIgnoreCase(Locale.getDefault().getCountry()) ? "HTG" : "USD";
+        }
 
         JSONArray c = array(prefs.getString("cart", "[]"));
         for (int i=0; i<c.length(); i++) {
@@ -174,6 +188,9 @@ public class ManaplaceEcommerce extends AndroidNonvisibleComponent {
                 .putString("addresses", a.toString())
                 .putString("coupon", couponCode)
                 .putLong("discount", Double.doubleToLongBits(couponDiscount))
+                .putString("base_currency", baseCurrency)
+                .putString("display_currency", displayCurrency)
+                .putLong("exchange_rate", Double.doubleToLongBits(exchangeRate))
                 .apply();
     }
 
@@ -249,22 +266,53 @@ public class ManaplaceEcommerce extends AndroidNonvisibleComponent {
         OnProductReceived(id, p.toString());
     }
 
-    @SimpleFunction(description="Reçoit une liste JSON de produits provenant de ManaplaceUtils.")
+    @SimpleFunction(description="Reçoit une liste JSON de produits (liste directe, ou objet contenant products/data/items/results).")
     public void ReceiveProductsFromUtils(String productsJson) {
-        JSONArray a = array(productsJson);
+        int count = ingestProducts(extractList(productsJson), "ReceiveProductsFromUtils");
+        OnProductsReceived(count);
+    }
+
+    // Accepte une liste directe ou un objet qui contient la liste.
+    private JSONArray extractList(String json) {
+        String t = json == null ? "" : json.trim();
+        if (t.startsWith("[")) return array(t);
+        JSONObject o = object(t);
+        String[] keys = {"products", "data", "items", "results"};
+        for (String k : keys) {
+            JSONArray a = o.optJSONArray(k);
+            if (a != null) return a;
+        }
+        return new JSONArray();
+    }
+
+    // Enregistre les produits valides. Signale un seul message pour les produits mal formés.
+    private int ingestProducts(JSONArray a, String source) {
         int count = 0;
+        StringBuilder badUid = new StringBuilder();
+        StringBuilder badPrice = new StringBuilder();
         synchronized (products) {
             for (int i=0; i<a.length(); i++) {
                 JSONObject p = a.optJSONObject(i);
                 if (p == null) continue;
                 String id = uid(p);
-                if (id.isEmpty()) continue;
+                if (id.isEmpty()) {
+                    if (badUid.length() < 40) badUid.append(i).append(' ');
+                    continue;
+                }
+                try { if (!p.has("uid")) p.put("uid", id); } catch (Exception ignored) {}
+                if (Double.isNaN(p.optDouble("price", Double.NaN))) {
+                    if (badPrice.length() < 80) badPrice.append(id).append(' ');
+                }
                 products.put(id, p);
-                if (p.has("stock")) stock.put(id, Math.max(0,p.optInt("stock",0)));
+                if (p.has("stock")) stock.put(id, Math.max(0, p.optInt("stock", 0)));
                 count++;
             }
         }
-        OnProductsReceived(count);
+        if (badUid.length() > 0)
+            OnError("[" + source + "] Produits sans uid/id ignorés (positions : " + badUid.toString().trim() + ").");
+        if (badPrice.length() > 0)
+            OnError("[" + source + "] Prix absent ou non numérique (price doit être un nombre) : " + badPrice.toString().trim());
+        return count;
     }
 
     @SimpleFunction(description="Transmet le clic d'une carte produit de ManaplaceUtils au moteur e-commerce.")
@@ -428,6 +476,9 @@ public class ManaplaceEcommerce extends AndroidNonvisibleComponent {
                             String key=k.next();
                             if(!x.has(key)) x.put(key,p.opt(key));
                         }
+                        String cur = curOf(p);
+                        x.put("price_display", formatPrice(p.optDouble("price",0), cur));
+                        x.put("subtotal_display", formatPrice(p.optDouble("price",0)*e.getValue(), cur));
                     }
                 } catch(Exception ignored){}
                 a.put(x);
@@ -598,7 +649,7 @@ public class ManaplaceEcommerce extends AndroidNonvisibleComponent {
         JSONObject x=new JSONObject();
         try{x.put("email",email==null?"":email);x.put("password",password==null?"":password);}
         catch(Exception ignored){}
-        ApiRequest("/auth/login","POST","",x.toString());
+        apiCall("login","/auth/login","POST","",x.toString());
     }
 
     @SimpleFunction(description="Envoie une inscription au backend.")
@@ -606,7 +657,7 @@ public class ManaplaceEcommerce extends AndroidNonvisibleComponent {
         JSONObject x=new JSONObject();
         try{x.put("email",email==null?"":email);x.put("password",password==null?"":password);
             x.put("display_name",displayName==null?"":displayName);}catch(Exception ignored){}
-        ApiRequest("/auth/register","POST","",x.toString());
+        apiCall("register","/auth/register","POST","",x.toString());
     }
 
     @SimpleFunction(description="Déconnecte la session locale.")
@@ -631,9 +682,15 @@ public class ManaplaceEcommerce extends AndroidNonvisibleComponent {
         return h;
     }
 
-    @SimpleFunction(description="Requête REST GET/POST/PUT/PATCH/DELETE.")
+    @SimpleFunction(description="Requête REST GET/POST/PUT/PATCH/DELETE. La réponse arrive dans OnApiResponse et OnApiResult (étiquette \"custom\").")
     public void ApiRequest(final String path,final String method,
                            final String headersJson,final String bodyJson) {
+        apiCall("custom", path, method, headersJson, bodyJson);
+    }
+
+    // Toutes les requêtes passent ici : l'étiquette (tag) dit d'où vient la réponse.
+    private void apiCall(final String tag,final String path,final String method,
+                         final String headersJson,final String bodyJson) {
         AsynchUtil.runAsynchronously(new Runnable(){public void run(){
             HttpURLConnection c=null;
             try {
@@ -656,10 +713,10 @@ public class ManaplaceEcommerce extends AndroidNonvisibleComponent {
                 InputStream in=code>=200&&code<400?c.getInputStream():c.getErrorStream();
                 final String response=read(in);
 
-                ui(new Runnable(){public void run(){OnApiResponse(code,response);}});
+                ui(new Runnable(){public void run(){handleApiResult(tag,code,response);}});
             } catch(final Exception e) {
                 ui(new Runnable(){public void run(){
-                    OnApiError(0,e.getMessage()==null?"Erreur réseau.":e.getMessage());
+                    OnApiError(0,"["+tag+"] "+(e.getMessage()==null?"Erreur réseau.":e.getMessage()));
                 }});
             } finally {if(c!=null)c.disconnect();}
         }});
@@ -681,20 +738,20 @@ public class ManaplaceEcommerce extends AndroidNonvisibleComponent {
     /* ======================== API METIERS ======================== */
 
     @SimpleFunction(description="Charge le catalogue depuis le serveur.")
-    public void LoadProductsFromServer(){ApiRequest(productsEndpoint,"GET","","");}
+    public void LoadProductsFromServer(){apiCall("products",productsEndpoint,"GET","","");}
 
     @SimpleFunction(description="Synchronise le panier local.")
     public void SyncCartToServer(){
         JSONObject x=new JSONObject();
         try{x.put("user_uid",userUid);x.put("items",array(GetCartJson()));}
         catch(Exception ignored){}
-        ApiRequest(cartEndpoint,"POST","",x.toString());
+        apiCall("cart_sync",cartEndpoint,"POST","",x.toString());
     }
 
     @SimpleFunction(description="Charge le panier du serveur.")
     public void LoadCartFromServer(){
         String p=cartEndpoint+(cartEndpoint.contains("?")?"&":"?")+"user_uid="+enc(userUid);
-        ApiRequest(p,"GET","","");
+        apiCall("cart_load",p,"GET","","");
     }
 
     @SimpleFunction(description="Synchronise les favoris.")
@@ -702,33 +759,34 @@ public class ManaplaceEcommerce extends AndroidNonvisibleComponent {
         JSONObject x=new JSONObject();
         try{x.put("user_uid",userUid);x.put("product_uids",array(GetFavoritesJson()));}
         catch(Exception ignored){}
-        ApiRequest(favoritesEndpoint,"POST","",x.toString());
+        apiCall("favorites_sync",favoritesEndpoint,"POST","",x.toString());
     }
 
     @SimpleFunction(description="Valide un coupon sur le serveur.")
     public void ValidateCoupon(String code){
+        pendingCouponCode=code==null?"":code;
         JSONObject x=new JSONObject();
         try{x.put("user_uid",userUid);x.put("coupon_code",code==null?"":code);
             x.put("subtotal",GetCartSubtotal());}catch(Exception ignored){}
-        ApiRequest(couponEndpoint,"POST","",x.toString());
+        apiCall("coupon",couponEndpoint,"POST","",x.toString());
     }
 
     @SimpleFunction(description="Crée une commande côté serveur.")
     public void CreateOrder(String addressUid,String shippingMethod,String paymentMethod){
         if(cart.isEmpty()){OnError("Panier vide.");return;}
-        ApiRequest(ordersEndpoint,"POST","",
+        apiCall("order_create",ordersEndpoint,"POST","",
                 BuildCheckoutJson(addressUid,shippingMethod,paymentMethod));
     }
 
     @SimpleFunction(description="Charge les commandes de l'utilisateur.")
     public void LoadOrders(){
         String p=ordersEndpoint+(ordersEndpoint.contains("?")?"&":"?")+"user_uid="+enc(userUid);
-        ApiRequest(p,"GET","","");
+        apiCall("orders",p,"GET","","");
     }
 
     @SimpleFunction(description="Récupère une commande par UID.")
     public void GetOrder(String orderUid){
-        ApiRequest(ordersEndpoint+"/"+enc(orderUid),"GET","","");
+        apiCall("order",ordersEndpoint+"/"+enc(orderUid),"GET","","");
     }
 
     @SimpleFunction(description="Crée une intention de paiement côté serveur. Le paiement réel doit être validé par le backend.")
@@ -737,22 +795,212 @@ public class ManaplaceEcommerce extends AndroidNonvisibleComponent {
         try{x.put("user_uid",userUid);x.put("order_uid",orderUid);
             x.put("provider",provider);x.put("amount",amount);x.put("currency",currency);}
         catch(Exception ignored){}
-        ApiRequest(paymentEndpoint,"POST","",x.toString());
+        apiCall("payment",paymentEndpoint,"POST","",x.toString());
     }
 
     @SimpleFunction(description="Envoie une adresse au serveur.")
     public void UploadAddress(String addressJson){
         JSONObject x=object(addressJson);try{x.put("user_uid",userUid);}catch(Exception ignored){}
-        ApiRequest(addressesEndpoint,"POST","",x.toString());
+        apiCall("address_upload",addressesEndpoint,"POST","",x.toString());
     }
 
     @SimpleFunction(description="Charge les adresses du serveur.")
     public void LoadAddressesFromServer(){
         String p=addressesEndpoint+(addressesEndpoint.contains("?")?"&":"?")+"user_uid="+enc(userUid);
-        ApiRequest(p,"GET","","");
+        apiCall("addresses",p,"GET","","");
+    }
+
+    /* ======================== DEVISES (G / $) ======================== */
+
+    private String normCur(String c) {
+        String x = c == null ? "" : c.trim().toUpperCase(Locale.US);
+        if (x.equals("G") || x.equals("HTG") || x.equals("GOURDE")) return "HTG";
+        if (x.equals("$") || x.equals("USD") || x.equals("DOLLAR")) return "USD";
+        return "";
+    }
+
+    private String curOf(JSONObject p) {
+        String c = normCur(p.optString("currency", ""));
+        return c.isEmpty() ? baseCurrency : c;
+    }
+
+    // Convertit un montant de la devise "from" vers la devise d'affichage.
+    // Sans taux (exchangeRate <= 0), aucune conversion n'est faite.
+    private double convert(double amount, String from) {
+        if (from.equals(displayCurrency) || exchangeRate <= 0) return amount;
+        if (from.equals("USD") && displayCurrency.equals("HTG")) return amount * exchangeRate;
+        if (from.equals("HTG") && displayCurrency.equals("USD")) return amount / exchangeRate;
+        return amount;
+    }
+
+    private String formatPrice(double amount, String from) {
+        boolean converted = !(from.equals(displayCurrency) || exchangeRate <= 0);
+        String shown = converted ? displayCurrency : from;
+        double v = convert(amount, from);
+        if (shown.equals("HTG")) {
+            return String.format(Locale.US, "%,d", Math.round(v)).replace(',', ' ') + " G";
+        }
+        return "$" + String.format(Locale.US, "%,.2f", v);
+    }
+
+    @SimpleFunction(description="Choisit la devise d'affichage : \"HTG\" (G) ou \"USD\" ($). Le choix est sauvegardé.")
+    public synchronized void SetDisplayCurrency(String code) {
+        String c = normCur(code);
+        if (c.isEmpty()) { OnError("SetDisplayCurrency: devise inconnue (utilise HTG ou USD)."); return; }
+        displayCurrency = c;
+        saveState();
+        OnCurrencyChanged(c);
+        OnCartChanged(GetCartJson());
+    }
+
+    @SimpleFunction(description="Retourne la devise d'affichage actuelle (HTG ou USD).")
+    public String GetDisplayCurrency() { return displayCurrency; }
+
+    @SimpleFunction(description="Devise des prix envoyés par le serveur quand un produit n'a pas de champ currency (HTG par défaut).")
+    public synchronized void SetBaseCurrency(String code) {
+        String c = normCur(code);
+        if (c.isEmpty()) { OnError("SetBaseCurrency: devise inconnue (utilise HTG ou USD)."); return; }
+        baseCurrency = c;
+        saveState();
+    }
+
+    @SimpleFunction(description="Taux de change fourni par ton serveur : nombre de gourdes (G) pour 1 dollar. Sans taux, les prix restent dans leur devise d'origine.")
+    public synchronized void SetExchangeRate(double gourdesPerDollar) {
+        if (gourdesPerDollar <= 0) { OnError("SetExchangeRate: le taux doit être supérieur à 0."); return; }
+        exchangeRate = gourdesPerDollar;
+        saveState();
+        OnCartChanged(GetCartJson());
+    }
+
+    @SimpleFunction(description="Retourne le taux de change enregistré (0 = aucun).")
+    public double GetExchangeRate() { return exchangeRate; }
+
+    @SimpleFunction(description="Formate un montant pour l'affichage (ex: \"2 500 G\" ou \"$19.20\"), converti dans la devise de l'utilisateur. fromCurrency : HTG ou USD (vide = devise de base).")
+    public String FormatPrice(double amount, String fromCurrency) {
+        String c = normCur(fromCurrency);
+        return formatPrice(amount, c.isEmpty() ? baseCurrency : c);
+    }
+
+    @SimpleFunction(description="Retourne tous les produits avec price_display (prix déjà converti et formaté). À donner à la grille de ManaplaceUtils.")
+    public String GetProductsDisplayJson() {
+        JSONArray a = new JSONArray();
+        synchronized (products) {
+            for (JSONObject p : products.values()) {
+                try {
+                    JSONObject x = new JSONObject(p.toString());
+                    x.put("price_display", formatPrice(p.optDouble("price", 0), curOf(p)));
+                    a.put(x);
+                } catch (Exception ignored) {}
+            }
+        }
+        return a.toString();
+    }
+
+    @SimpleFunction(description="Sous-total du panier, converti et formaté dans la devise de l'utilisateur.")
+    public synchronized String GetCartSubtotalDisplay() { return formatTotal(cartSubtotalDisplayValue()); }
+
+    @SimpleFunction(description="Remise du coupon, formatée dans la devise de l'utilisateur.")
+    public synchronized String GetCouponDiscountDisplay() { return formatTotal(convert(couponDiscount, baseCurrency)); }
+
+    @SimpleFunction(description="Total du panier après remise, formaté dans la devise de l'utilisateur.")
+    public synchronized String GetCartTotalDisplay() {
+        double t = cartSubtotalDisplayValue() - convert(couponDiscount, baseCurrency);
+        return formatTotal(Math.max(0, t));
+    }
+
+    private double cartSubtotalDisplayValue() {
+        double total = 0;
+        synchronized (products) {
+            for (Map.Entry<String,Integer> e : cart.entrySet()) {
+                JSONObject p = products.get(e.getKey());
+                if (p != null) total += convert(p.optDouble("price", 0) * e.getValue(), curOf(p));
+            }
+        }
+        return total;
+    }
+
+    // Formate un montant déjà exprimé dans la devise d'affichage.
+    private String formatTotal(double v) {
+        if (displayCurrency.equals("HTG"))
+            return String.format(Locale.US, "%,d", Math.round(v)).replace(',', ' ') + " G";
+        return "$" + String.format(Locale.US, "%,.2f", v);
+    }
+
+    /* ======================== TRAITEMENT AUTOMATIQUE DES RÉPONSES ======================== */
+
+    // Cherche une valeur dans l'objet, puis dans "data", puis dans "user".
+    private String firstString(JSONObject o, String... keys) {
+        JSONObject[] levels = { o, o.optJSONObject("data"), o.optJSONObject("user") };
+        for (JSONObject lv : levels) {
+            if (lv == null) continue;
+            for (String k : keys) {
+                String v = lv.optString(k, "");
+                if (!v.isEmpty() && !v.equals("null")) return v;
+            }
+        }
+        return "";
+    }
+
+    private void handleApiResult(String tag, int code, String resp) {
+        OnApiResponse(code, resp);
+        OnApiResult(tag, code, resp);
+        if (code < 200 || code >= 300) return;
+
+        if (tag.equals("products")) {
+            int count = ingestProducts(extractList(resp), "products");
+            if (count == 0) OnError("[products] Aucun produit valide dans la réponse du serveur.");
+            OnProductsReceived(count);
+            OnProductsReady(GetProductsDisplayJson());
+
+        } else if (tag.equals("login") || tag.equals("register")) {
+            JSONObject o = object(resp);
+            String t = firstString(o, "token", "access_token");
+            String u = firstString(o, "uid", "user_uid", "id");
+            if (t.isEmpty() || u.isEmpty()) {
+                OnError("[" + tag + "] Réponse sans token ou sans uid : connexion non enregistrée.");
+                return;
+            }
+            synchronized (this) { authToken = t; userUid = u; saveState(); }
+            OnUserChanged(u);
+
+        } else if (tag.equals("coupon")) {
+            JSONObject o = object(resp);
+            double d = o.optDouble("discount", o.optDouble("amount", 0));
+            boolean valid = o.optBoolean("valid", d > 0);
+            String c = firstString(o, "code", "coupon_code");
+            if (c.isEmpty()) c = pendingCouponCode;
+            if (valid && d > 0) ApplyFixedDiscount(c, d);
+            else OnError("[coupon] Coupon invalide ou sans remise.");
+
+        } else if (tag.equals("order_create")) {
+            JSONObject o = object(resp);
+            String oid = firstString(o, "uid", "order_uid", "id");
+            ClearCart();
+            OnOrderCreated(oid, resp);
+        }
     }
 
     /* ======================== EVENEMENTS ======================== */
+
+    @SimpleEvent(description="Réponse du serveur avec l'étiquette de la requête : products, login, register, coupon, order_create, orders, order, payment, cart_sync, cart_load, favorites_sync, address_upload, addresses ou custom.")
+    public void OnApiResult(String tag,int responseCode,String responseJson){
+        EventDispatcher.dispatchEvent(this,"OnApiResult",tag,responseCode,responseJson);
+    }
+
+    @SimpleEvent(description="Catalogue chargé depuis le serveur. Donne ce JSON (avec prix déjà formatés) à BuildProductGridFromJson de ManaplaceUtils.")
+    public void OnProductsReady(String displayJson){
+        EventDispatcher.dispatchEvent(this,"OnProductsReady",displayJson);
+    }
+
+    @SimpleEvent(description="Commande créée avec succès sur le serveur. Le panier a été vidé.")
+    public void OnOrderCreated(String orderUid,String orderJson){
+        EventDispatcher.dispatchEvent(this,"OnOrderCreated",orderUid,orderJson);
+    }
+
+    @SimpleEvent(description="La devise d'affichage a changé.")
+    public void OnCurrencyChanged(String currency){
+        EventDispatcher.dispatchEvent(this,"OnCurrencyChanged",currency);
+    }
 
     @SimpleEvent public void OnProductReceived(String productUid,String productJson){
         EventDispatcher.dispatchEvent(this,"OnProductReceived",productUid,productJson);
